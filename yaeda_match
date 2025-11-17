@@ -792,10 +792,14 @@ for idx, row in df_internal.iterrows():
             stats['fio_only'] += 1
     
     # СТРАТЕГИЯ 6: Поиск через ЛК ЯЕДА (по телефону + ФИО + дате)
-    if not best_match and df_lk_yeda is not None and len(lk_yeda_index) > 0:
+    # Запускается когда: не найдено совпадение ИЛИ score < 80
+    current_score = best_match['score'] if best_match else 0
+    if (not best_match or current_score < 80) and df_lk_yeda is not None and len(lk_yeda_index) > 0:
         internal_phone = row['_norm_phone']
         internal_fio_parts = set(internal_fio.split())
-        
+
+        lk_match_found = False
+
         # Ищем совпадение в ЛК ЯЕДА
         for ext_id, lk_data in lk_yeda_index.items():
             # Проверяем телефон (последние 4 цифры)
@@ -803,56 +807,80 @@ for idx, row in df_internal.iterrows():
                 continue
             if internal_phone[-4:] != lk_data['phone_last4']:
                 continue
-            
-            # Проверяем дату
+
+            # Проверяем дату (lead_created_at)
             if internal_date != lk_data['date']:
                 continue
-            
-            # Проверяем ФИО (имя и фамилия должны присутствовать)
+
+            # Проверяем ФИО (first_name + last_name из ЛК ЯЕДА)
             lk_first_name = lk_data['first_name']
             lk_last_name = lk_data['last_name']
-            
+
             # Проверяем, что хотя бы имя или фамилия есть в ФИО
             name_match = False
             if lk_first_name and lk_first_name in internal_fio:
                 name_match = True
             if lk_last_name and lk_last_name in internal_fio:
                 name_match = True
-            
+
             # Или проверяем по словам
             lk_parts = set([lk_first_name, lk_last_name]) - {''}
             common_parts = internal_fio_parts.intersection(lk_parts)
             if len(common_parts) >= 1:
                 name_match = True
-            
+
             if not name_match:
                 continue
-            
-            # Нашли совпадение в ЛК ЯЕДА! Теперь ищем в БИЛЛИНГ по external_id
-            # Проходим по всем записям биллинга и ищем этот external_id
+
+            # НАЙДЕНО СОВПАДЕНИЕ В ЛК ЯЕДА!
+            # external_id из ЛК ЯЕДА используется в любом случае
+            lk_match_found = True
+
+            # Пытаемся найти дополнительные данные в БИЛЛИНГ по этому external_id
+            billing_data = None
             for bill in billing_full_list:
                 if bill['external_id'] == ext_id:
-                    # Вычисляем score
-                    score = 100  # Высокий score т.к. совпадение по телефону + дате + ФИО
-                    details = f"Телефон:совпал(***{internal_phone[-4:]}) | Дата:точная | ФИО:частично(ЛК:{lk_last_name} {lk_first_name})"
-                    
-                    best_match = {
-                        'external_id': ext_id,
-                        'score': score,
-                        'details': f"[LK_YEDA_PHONE] {details} | Биллинг: {bill['original_fio']} / {bill['original_city']}",
-                        'payment': bill['payment'],
-                        'n_orders_20_days': bill['n_orders_20_days'],
-                        'first_order_date': bill['first_order_date'],
-                        'lead_date': bill['lead_date']
-                    }
-                    stats['lk_yeda_match'] += 1
+                    billing_data = bill
                     break
-            
-            if best_match:
-                break
+
+            # Вычисляем score
+            score = 100  # Высокий score т.к. совпадение по телефону + дате + ФИО из ЛК ЯЕДА
+            details = f"Телефон:совпал(***{internal_phone[-4:]}) | Дата:точная | ФИО:частично(ЛК:{lk_last_name} {lk_first_name})"
+
+            # Формируем результат с external_id из ЛК ЯЕДА
+            if billing_data:
+                # Если нашли в БИЛЛИНГ - берем оттуда payment, n_orders и т.д.
+                best_match = {
+                    'external_id': ext_id,
+                    'score': score,
+                    'details': f"[LK_YEDA_PHONE] {details} | Биллинг: {billing_data['original_fio']} / {billing_data['original_city']}",
+                    'payment': billing_data['payment'],
+                    'n_orders_20_days': billing_data['n_orders_20_days'],
+                    'first_order_date': billing_data['first_order_date'],
+                    'lead_date': billing_data['lead_date']
+                }
+            else:
+                # Если НЕ нашли в БИЛЛИНГ - все равно используем external_id из ЛК ЯЕДА
+                best_match = {
+                    'external_id': ext_id,
+                    'score': score,
+                    'details': f"[LK_YEDA_PHONE] {details} | ЛК:{lk_data['fio']} (данных в БИЛЛИНГ нет)",
+                    'payment': None,
+                    'n_orders_20_days': None,
+                    'first_order_date': None,
+                    'lead_date': lk_data['date']  # Используем дату из ЛК ЯЕДА
+                }
+
+            stats['lk_yeda_match'] += 1
+            break
+
+        # Если нашли через ЛК ЯЕДА - не делаем DOUBLE_CHECK
+        if lk_match_found:
+            pass  # best_match уже установлен
     
     # ДВОЙНАЯ ПРОВЕРКА для низких score (< 95)
-    if best_match and best_match['score'] < 95:
+    # НЕ применяем к результатам из ЛК ЯЕДА (они уже проверены по телефону)
+    if best_match and best_match['score'] < 95 and '[LK_YEDA_PHONE]' not in best_match['details']:
         improved_match = double_check_match(internal_fio, internal_city, internal_date, best_match)
         if improved_match and improved_match['score'] > best_match['score']:
             best_match = improved_match
@@ -869,19 +897,23 @@ for idx, row in df_internal.iterrows():
     
     # ФИНАЛЬНАЯ ВАЛИДАЦИЯ: проверяем score и точность совпадений
     if best_match:
-        # Для DOUBLE_CHECK требуем score >= 70 (уже проверено выше, но на всякий случай)
-        if '[DOUBLE_CHECK]' in best_match['details'] and best_match['score'] < 70:
-            best_match = None
-            stats['no_match'] += 1
-        # Для score < 95 ТРЕБУЕМ точное совпадение даты И города
-        elif best_match['score'] < 95:
-            has_exact_date = "Дата:точная" in best_match['details']
-            has_exact_city = "Город:точный" in best_match['details']
-            
-            if not (has_exact_date and has_exact_city):
-                # Отклоняем совпадение - риск дубликата
+        # НЕ применяем валидацию к результатам из ЛК ЯЕДА (они уже проверены по телефону)
+        is_lk_yeda_match = '[LK_YEDA_PHONE]' in best_match['details']
+
+        if not is_lk_yeda_match:
+            # Для DOUBLE_CHECK требуем score >= 70 (уже проверено выше, но на всякий случай)
+            if '[DOUBLE_CHECK]' in best_match['details'] and best_match['score'] < 70:
                 best_match = None
                 stats['no_match'] += 1
+            # Для score < 95 ТРЕБУЕМ точное совпадение даты И города
+            elif best_match['score'] < 95:
+                has_exact_date = "Дата:точная" in best_match['details']
+                has_exact_city = "Город:точный" in best_match['details']
+
+                if not (has_exact_date and has_exact_city):
+                    # Отклоняем совпадение - риск дубликата
+                    best_match = None
+                    stats['no_match'] += 1
     
     # Записываем результат
     if best_match:
